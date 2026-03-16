@@ -1,0 +1,121 @@
+openapi: 3.0.3
+info:
+  title: Wasagro Backend API
+  version: 0.1.0
+  description: |
+    API inicial para el backend de Wasagro. Incluye endpoints de lectura
+    para dashboards (integridad de datos, KPIs, eventos) y gestión básica
+    de preferencias de usuario.
+servers:
+  - url: https://api.wasagro.local
+    description: Servidor de desarrollo
+
+paths:
+  /farms/{farmId}/data-integrity:
+    get:
+      summary: Obtener métricas de integridad de datos para una finca
+      parameters:
+        - in: path
+          name: farmId
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Métricas de integridad
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  coverage_ratio:
+                    type: number
+                    format: float
+                  avg_reporting_delay_hours:
+                    type: number
+                    format: float
+                  critical_alerts_open:
+                    type: integer
+
+  /farms/{farmId}/main-kpis:
+    get:
+      summary: Obtener KPIs principales de una finca para un rango de fechas
+      parameters:
+        - in: path
+          name: farmId
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Lista de KPIs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    code:
+                      type: string
+                    label:
+                      type: string
+                    value:
+                      type: number
+                    unit:
+                      type: string
+                    delta_vs_plan:
+                      type: number
+                      nullable: true
+
+  /user-preferences:
+    get:
+      summary: Obtener preferencias del usuario autenticado para una finca
+      parameters:
+        - in: query
+          name: farmId
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Preferencias actuales
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  focus:
+                    type: string
+                  time_horizon:
+                    type: string
+                  detail_level:
+                    type: string
+                  report_frequency:
+                    type: string
+                  delivery_channels:
+                    type: string
