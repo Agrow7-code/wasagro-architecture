@@ -9,21 +9,23 @@ Este documento describe la arquitectura AI-first de Wasagro: cómo se capturan d
 1. **La IA es la interfaz de ingestión**  
    La IA no es solo un dashboard posterior. Es el primer actor que recibe audios, fotos y texto, y los transforma en eventos de base de datos.
 
-2. **Operador PDR/SR ligero**  
-   En lugar de una sola pasada prompt → respuesta, usamos un ciclo corto de:
-   - **P** (Parallel Drafting): uno o varios borradores de interpretación.  
-   - **D** (Distillation): consolidar esos borradores.  
-   - **R** (Refinement / Sequential-Refine): pulir el resultado final y marcar dudas.
+2. **Agente PDR/SR = Reflexion Agent**  
+   El operador PDR/SR es académicamente un **Reflexion agent** (Shinn et al., 2023) combinado con el patrón **ReAct** (Yao et al., 2023):
+   - **ReAct**: el agente alterna razonamiento y acción en el mismo contexto de tokens.
+   - **Reflexion**: añade un paso de auto-crítica antes de finalizar.
+   - En Wasagro: genera borrador → critica → refina → produce JSON final o pregunta.
 
-3. **Loop humano activo**  
-   Cuando faltan campos críticos (lote, dosis, fecha) o la confianza es baja, la IA **pregunta de vuelta** por WhatsApp antes de cerrar el evento.
+3. **Workspace como memoria de conversación**  
+   Para conversaciones multi-turn, no se envía todo el historial al LLM. Se envía solo el JSON parcial actual + el último mensaje del usuario. Reducción de tokens multi-turn: **70–80%**.
 
-4. **RAG y destilación como capas ortogonales**  
-   - RAG trae conocimiento externo (etiquetas, normas, SOPs, historial).  
-   - La destilación va internalizando skills frecuentes en modelos pequeños específicos.
+4. **Loop humano activo**  
+   Cuando faltan campos críticos o la confianza es baja, la IA pregunta de vuelta por WhatsApp. Los SLAs de respuesta humana deben estar definidos para eventos críticos.
 
-5. **Deliver anti‑maquillaje**  
-   La capa de entrega (dashboards, reportes, resúmenes WA) está diseñada para mostrar siempre la calidad del dato y evitar que la realidad se “endulce” a medida que sube en la organización.
+5. **RAG y destilación como capas ortogonales**  
+   RAG trae conocimiento externo (MRLs UE, fichas técnicas, BPAs). La destilación internaliza skills frecuentes en modelos pequeños.
+
+6. **Deliver anti-maquillaje**  
+   La capa de entrega muestra siempre la calidad del dato y evita que la realidad se endulce al subir en la organización.
 
 ---
 
@@ -31,201 +33,135 @@ Este documento describe la arquitectura AI-first de Wasagro: cómo se capturan d
 
 ```text
 [Canales de campo]
-  - WhatsApp / Telegram / red social preferida
-  - (Opcional) App ligera
-  - (Opcional) Botón físico / dispositivo IoT
+  - WhatsApp / Telegram
+  - (Opcional) App ligera / IoT
 
         │
         ▼
 1) EXTRACT  (Ingesta multimodal)
-  - STT: transcribe audio (Whisper/Voxtral/…)
-  - OCR: texto desde fotos (libretas, etiquetas, carteles)
-  - Texto nativo: mensajes escritos
-  - Metadata: usuario, rol, finca, lote (si viene), timestamp, geolocalización
+  - STT: audio → texto (Whisper self-hosted / Voxtral)
+      · Post-corrección STT con LLM: corregir jerga agro antes de estructurar
+  - OCR: texto desde fotos (libretas, etiquetas)
+  - Texto nativo
+  - Metadata: usuario, rol, finca, timestamp
 
         │
         ▼
 2) CATEGORIZE  (Router de complejidad / presupuesto)
-  - Clasificación de tipo de evento:
-      · plaga / enfermedad
-      · uso de insumo / agroquímico
-      · avance de labores / tareas
-      · gasto / insumo económico
-      · nota libre / consulta
-  - Estimación de:
-      · riesgo agronómico / normativo
-      · necesidad de conocimiento externo (RAG o no)
-      · presupuesto de cómputo y latencia por rol
-  - Decisión de ruta:
-      · solo Modelo Base + PDR/SR ligero
-      · Modelo Base + RAG
-      · Modelo Premium + RAG
-      · activar o no multiagentes de verificación
-
-        │
-        ├─────────────▶ [Capa de Eficiencia]
-        │                 - Prompt caching
-        │                 - Serialización JSON compacta
-        │                 - Compresión LLMLingua-2 en system prompts / few-shots
-        │
-        ▼
-3) QUOTE  (Agente estructurador PDR/SR ligero)
-  - Modelo Base (80% del volumen) opera como OPERADOR, no como una sola pasada:
-      · Entrada: {transcripción STT, texto OCR, texto nativo, metadata, contexto corto}
-      · Ronda 0: genera 1–N borradores de JSON (evento estructurado)
-      · Ronda 1 (SR o PDR):
-          · SR: refine sobre un borrador con feedback interno
-          · PDR: varios borradores + distillation a un workspace compacto
-      · Salida:
-          · JSON estructurado (evento) normalizado
-          · Workspace corto (razonamiento clave / dudas)
+  - Clasifica tipo de evento (plaga, insumo, labor, gasto, consulta)
+  - Decide ruta:
+      · Modelo Base + PDR/SR            → 55% del volumen
+      · Modelo Base + RAG               → 15% del volumen
+      · Modelo Premium + RAG + agentes  →  5% del volumen
+  - Capa de eficiencia: prompt caching, LLMLingua-2
 
         │
         ▼
-4) ANALYZE  (Motor de análisis y decisión)
-  - Lado clásico (no‑LLM):
-      · KPIs (rendimiento, uso de insumos, costos)
-      · detección de anomalías simples
-  - Lado LLM:
-      · consultas complejas sobre historial
-      · generación de explicaciones y resúmenes por lote/finca
-  - RAG (capa ortogonal 1):
-      · se activa cuando el router marca que la consulta es knowledge‑intensive
+3) QUOTE  (Agente estructurador PDR/SR — Reflexion Agent)
+  - Paso 1: genera borrador JSON (ReAct)
+  - Paso 2: auto-crítica de campos faltantes (Reflexion)
+  - Paso 3: refina JSON o genera pregunta mínima
+  - Workspace: solo JSON parcial + reflexion_note (no historial completo)
+
+        │
+        ▼
+4) ANALYZE  (Motor de análisis)
+  - KPIs clásicos + consultas LLM
+  - RAG sobre corpus agro (MRLs UE, fichas, BPAs)
 
         │
         ▼
 5) ASSIST  (Asistencia en tiempo real)
-  - Generación de respuestas y recomendaciones por WhatsApp:
-      · mensajes claros y accionables
-      · checklists de “próximos pasos”
-  - Multiagentes (calidad, no costo):
-      · verificador de dosis/normas
-      · agente que cruza con historial del lote y clima
-      · agente auditor para casos críticos
+  - Respuestas/recomendaciones por WhatsApp
+  - Multiagentes: verificador dosis/normas, auditor de eventos críticos
 
         │
         ▼
 6) DELIVER  (Entrega)
-  - Respuesta inmediata en WhatsApp / red social
-  - Panel web por finca y rol
-  - Reportes PDF/Excel periódicos
-  - Webhooks / APIs hacia ERP/contabilidad
+  - WhatsApp, panel web, reportes PDF/Excel, APIs ERP
+
+        │
+        ▼
+7) OBSERVE  (Observabilidad — obligatoria desde día 1)
+  - LangFuse self-hosted: traza cada llamada LLM/STT
+  - Dataset de evals: pares {mensaje → JSON esperado}
+  - Métrica: field-level accuracy por tipo de evento
 ```
+
+Ver `docs/09-observabilidad-evals.md` para la estrategia completa de observabilidad.
 
 ---
 
-## 3. Componentes de backend y servicios
+## 3. Definición técnica del agente PDR/SR (Reflexion Agent)
 
-### 3.1 Servicios API
+Referencias académicas:
 
-- `auth-service`
-  - Login, JWT, autorización por rol.
+- **ReAct** (Yao et al., 2023 — arXiv:2210.03629): alterna razonamiento y acción en el mismo contexto.
+- **Reflexion** (Shinn et al., 2023 — arXiv:2303.11366): auto-evaluación verbal antes de finalizar.
 
-- `user-config-service`
-  - Maneja las preferencias de visualización de cada usuario/finca (resultado de la mini‑encuesta por WA).
+### Representación del workspace
 
-- `events-service`
-  - CRUD de eventos (`events`, `event_payloads`).
-  - Endpoints agregados para KPIs, alertas, timelines.
+```json
+{
+  "event_type": "input_application",
+  "confidence": 0.85,
+  "fields_extracted": {
+    "id_field": null,
+    "input_name": "Round-Up",
+    "dose": 0.5,
+    "dose_unit": "bombada",
+    "area_ha": null,
+    "event_time": "hoy mañana"
+  },
+  "mandatory_missing": ["id_field", "area_ha"],
+  "pending_question": "¿En qué lote aplicaste el Round-Up?",
+  "reflexion_note": "dose_unit 'bombada' requiere normalización a L/ha — preguntar área antes de normalizar"
+}
+```
 
-- `weather-service`
-  - Ingesta y consulta de `weather_hourly`.
-  - Unión espacial/temporal con eventos.
+Solo este JSON se reenvía al LLM en el siguiente turno (no el historial completo).
 
-- `whatsapp-bot-service`
-  - Webhook con proveedor de WhatsApp.
-  - Implementa la máquina de estados de conversación para:
-    - captura de eventos de campo,
-    - onboarding de gerentes,
-    - envío de informes/resúmenes.
+### Experimento de validación (< $5 en API)
 
-- `reporting-service`
-  - Generación de reportes PDF/Excel.
-  - Manejo de estados `draft` / `approved` / `sent`.
-
-- `dashboard-web`
-  - SPA (React/Vue/etc.) para gerentes y equipo técnico.
-
-### 3.2 Flujo de un evento típico (plaga)
-
-1. Trabajador envía audio por WhatsApp: “Encontré roya fuerte en el lote 4, parte baja.”
-2. `whatsapp-bot-service` recibe el webhook, guarda `raw_message`.
-3. `EXTRACT`:
-   - STT transcribe audio.
-   - Se normaliza texto y se asocia a `id_user`, `id_farm` vía número de teléfono.
-4. `CATEGORIZE`:
-   - Clasificador predice `event_type = pest`, `scope = field`.
-   - Marca que se requiere lote obligatorio.
-5. `QUOTE` (PDR/SR ligero):
-   - Modelo base genera borrador de JSON:
-     ```json
-     {
-       "event_type": "pest",
-       "pest_name": "roya",
-       "severity": "alta",
-       "field_candidate": "Lote 4",
-       "event_time": "hoy 06:30"
-     }
-     ```
-   - Refinement valida lote contra BD y normaliza fecha.
-   - Si falta algo esencial (ej. lote o fecha clara), el sistema pregunta por WA.
-6. Se guarda `event` + `event_payload` + `workspace`.
-7. `ANALYZE`/`ASSIST` decide si se dispara una recomendación inmediata (ej. monitoreo extra, acción correctiva).
-8. El evento y sus efectos se reflejan en el panel y en futuros reportes.
+Antes de escribir código de producción:
+1. Tomar 10–20 audios reales de campo, transcribirlos.
+2. Testear 3 variantes: single-shot, ReAct 2 pasos, Reflexion 3 pasos.
+3. Medir field-level accuracy campo por campo.
+4. Elegir la variante con mejor accuracy/costo como prompt base del MVP.
 
 ---
 
 ## 4. Router de complejidad / presupuesto
 
-El router decide qué ruta seguir para cada mensaje, usando:
+Rutas de decisión:
 
-- Features de entrada:
-  - tipo de usuario (rol),
-  - tipo de evento estimado,
-  - longitud del mensaje,
-  - historial de problemas recientes en la finca,
-  - nivel de riesgo (ej. plagas y agroquímicos son alto riesgo).
+- `ACCEPT_BASE`: modelo base + PDR/SR.
+- `ESCALATE_RAG`: modelo base + RAG.
+- `ESCALATE_PREMIUM`: modelo premium + RAG + multiagentes.
+- `ASK_CLARIFICATION`: pedir datos faltantes antes de crear evento.
 
-- Acciones posibles:
-  - `ACCEPT_BASE`: usar solo modelo base + PDR/SR.
-  - `ESCALATE_RAG`: usar modelo base + RAG.
-  - `ESCALATE_PREMIUM`: usar modelo premium + RAG + multiagentes.
-  - `ASK_CLARIFICATION`: no crear evento aún, pedir datos faltantes.
-
-En el MVP, el router puede implementarse con reglas estáticas. Más adelante puede entrenarse un policy (RL) inspirada en cascadas de modelos.
+En MVP: reglas estáticas. En v1: clasificador destilado (Llama 3.1 8B fine-tuned) → costo −99%.
 
 ---
 
 ## 5. RAG y destilación de skills
 
-### 5.1 RAG (capa ortogonal)
+Ver `docs/10-corpus-rag-agro.md` para el corpus completo.
 
-- Índices sobre:
-  - etiquetas de productos,
-  - manuales/SOPs,
-  - normativa y documentación interna,
-  - parte del historial de eventos.
+**Query killer feature**: *"¿Puedo aplicar X a Y días de cosecha para mercado europeo?"*
 
-- Servicio `rag-service`:
-  - `retrieve(query, k)` devuelve pasajes relevantes.
-  - Se usa cuando `router.need_rag = true`.
-
-### 5.2 Destilación de skills
-
-- A partir de logs reales (input crudo + evento final) se entrenan modelos pequeños para:
-  - clasificar tipo de evento,
-  - normalizar unidades/formatos,
-  - detectar dosis fuera de rango,
-  - mapear jerga → esquema interno.
-
-- Estos modelos se intercalan antes del LLM generalista progresivamente, reduciendo tokens y costo a largo plazo.
+**Stack**: pgvector (ya en Postgres) + `text-embedding-3-small`.
 
 ---
 
-## 6. Capa DELIVER consciente de integridad del dato
+## 6. Capa DELIVER anti-maquillaje
 
-- Todos los canales de salida (WA, panel, reportes, APIs) muestran:
-  - métricas de **integridad de datos** (cobertura, retraso, alertas abiertas),
-  - separación clara entre dato crudo, agregación y narrativa.
+Todos los canales muestran métricas de integridad de datos y separan dato crudo / agregación / narrativa IA.
 
-- El objetivo no es reportar “todo verde”, sino permitir decisiones basadas en realidad, incluso cuando la realidad es incómoda.
+---
+
+## 7. Observabilidad
+
+Ver `docs/09-observabilidad-evals.md` para la estrategia completa.
+
+**Meta MVP**: field-level accuracy ≥ 85% antes de lanzar a usuarios reales.
