@@ -6,30 +6,60 @@ Este documento define la estrategia de observabilidad y evaluación de calidad p
 
 ---
 
-## 9.1 Stack de observabilidad
+## 9.1 Stack de observabilidad: LangFuse self-hosted
 
-### LangFuse (self-hosted en GCP)
+### Qué es LangFuse
 
-- **Qué es**: herramienta open source para trazar, evaluar y depurar pipelines LLM. Es el stack más usado en producción en 2025 para este tipo de pipeline.
-- **Por qué self-hosted**: gratuito, los datos de campo no salen del entorno, fácil de desplegar en GKE.
-- **Qué traza**:
-  - cada llamada LLM (modelo, tokens input/output, latencia, costo estimado),
-  - cada llamada STT (duración, confianza, modelo usado),
-  - cada decisión del router (tipo de evento predicho, ruta elegida),
-  - resultado final (JSON producido, campos extraídos, mandatory_missing resueltos).
+[LangFuse](https://langfuse.com) es una herramienta open source para trazar, evaluar y depurar pipelines LLM. Es el stack más usado en producción en 2025 para exactamente este tipo de pipeline.
 
-### Integración con el pipeline
+### Deploy en GCP (MVP)
 
-Cada servicio que llama a un LLM o STT envía trazas a LangFuse:
+Ref: https://langfuse.com/docs/deployment/self-host
+
+- **Stack**: Cloud Run (2 contenedores: langfuse-web + langfuse-worker) + Cloud SQL Postgres (el mismo que ya tienes).
+- **Costo adicional**: ~$5–10/mes en Cloud Run para el volumen de un MVP.
+- **Ventaja**: los datos de campo no salen del entorno GCP. Cero costo de licencia.
+
+### Pasos de instalación resumidos
+
+1. Clonar el repo de LangFuse y configurar variables de entorno (`DATABASE_URL` apuntando a tu Cloud SQL).
+2. Desplegar los dos contenedores en Cloud Run con imagen oficial.
+3. Configurar autenticación (Google OAuth o usuario/clave).
+4. Obtener `LANGFUSE_PUBLIC_KEY` y `LANGFUSE_SECRET_KEY` para el SDK.
+
+### Integración con el pipeline de Wasagro
 
 ```python
-# Ejemplo conceptual
-with langfuse.trace(name="pdr_sr_agent", metadata={"event_type": "pest", "farm_id": farm_id}) as trace:
-    transcript = stt_service.transcribe(audio)  # traza STT
-    draft = llm.complete(prompt_borrador)        # traza LLM paso 1
-    critique = llm.complete(prompt_reflexion)    # traza LLM paso 2
-    final_json = llm.complete(prompt_refinement) # traza LLM paso 3
-    trace.score(name="completeness", value=completeness_ratio)
+from langfuse import Langfuse
+langfuse = Langfuse()  # usa variables de entorno LANGFUSE_*
+
+# Trazar un ciclo completo de PDR/SR
+with langfuse.trace(
+    name="pdr_sr_agent",
+    metadata={"event_type": "pest", "farm_id": farm_id, "turn": turn_number}
+) as trace:
+    # Paso STT
+    transcript = stt_service.transcribe(audio_uri)
+    trace.span(name="stt", input={"audio_uri": audio_uri}, output={"transcript": transcript})
+
+    # Post-corrección STT con LLM
+    corrected = llm.correct_agro_vocab(transcript, vocab_list)
+    trace.span(name="stt_correction", input=transcript, output=corrected)
+
+    # Paso 1: borrador (ReAct)
+    draft = llm.draft(corrected, workspace_json)
+    trace.span(name="draft", input=corrected, output=draft)
+
+    # Paso 2: auto-crítica (Reflexion)
+    critique = llm.critique(draft)
+    trace.span(name="critique", input=draft, output=critique)
+
+    # Paso 3: JSON final o pregunta
+    result = llm.refine(draft, critique)
+    trace.span(name="refine", input=critique, output=result)
+
+    # Score de completitud
+    trace.score(name="field_accuracy", value=compute_field_accuracy(result, expected))
 ```
 
 ---
@@ -59,9 +89,9 @@ Sin un dataset de evals no puedes saber:
 
 **Cómo construirlo**:
 1. Recopilar audios/mensajes reales de campo (con permiso de usuarios).
-2. Transcribir manualmente los audios que tengan transcripción incierta.
+2. Transcribir manualmente los audios con transcripción incierta.
 3. Construir el JSON esperado a mano para cada mensaje.
-4. Guardar los pares en una tabla de evals (`eval_dataset`) en la BD.
+4. Guardar en la tabla `eval_dataset` (ver `backend/sql/01-schema-core.sql`).
 
 ---
 
@@ -69,29 +99,24 @@ Sin un dataset de evals no puedes saber:
 
 ### Field-level accuracy (métrica principal)
 
-Evalúa qué porcentaje de campos obligatorios se extrajo **correctamente** en el JSON final.
-
-| Campo | Peso | Criterio de "correcto" |
+| Campo | Peso | Criterio de “correcto” |
 |---|---|---|
 | `event_type` | Alto | Tipo de evento correcto |
 | `id_field` (lote) | Crítico | Lote mapeado al ID correcto |
 | `event_time` | Alto | Fecha/hora dentro de ±1 hora |
-| `dose` | Crítico (para aplicaciones) | Valor numérico correcto |
+| `dose` | Crítico (aplicaciones) | Valor numérico correcto |
 | `dose_unit` | Alto | Unidad correcta o normalizable |
-| `pest_name` | Medio | Nombre reconocible (puede haber variantes) |
+| `pest_name` | Medio | Nombre reconocible |
 
-**Cálculo**:
-```
-field_level_accuracy = campos_correctos / total_campos_obligatorios
-```
+**Meta MVP**: ≥ 85% de field-level accuracy antes de lanzar a usuarios reales.
 
-**Meta MVP**: ≥ 85% de field-level accuracy en el dataset de evals antes de lanzar a usuarios reales.
+Los resultados se guardan en la tabla `eval_results` para comparar versiones de modelo/prompt.
 
 ### Métricas secundarias
 
-- **Tasa de mandatory_missing**: porcentaje de eventos que requieren al menos 1 pregunta de aclaración.
-- **Turnos promedio para completar un evento**: cuántos mensajes necesita el usuario para registrar un evento completo.
-- **Latencia del pipeline**: tiempo desde que llega el mensaje hasta que se envía confirmación al usuario.
+- **Tasa de mandatory_missing**: % de eventos que requieren al menos 1 pregunta de aclaración.
+- **Turnos promedio para completar un evento**: mensajes necesarios hasta evento completo.
+- **Latencia del pipeline**: tiempo desde mensaje hasta confirmación al usuario.
 - **Costo por evento**: tokens LLM + STT por evento completado.
 
 ---
@@ -101,8 +126,8 @@ field_level_accuracy = campos_correctos / total_campos_obligatorios
 1. **Baseline**: medir field-level accuracy con el prompt inicial sobre el dataset de evals.
 2. **Identificar debilidades**: qué campos se pierden más, qué tipos de mensaje fallan más.
 3. **Iterar el prompt** del agente PDR/SR y re-medir sobre el mismo dataset.
-4. **Registrar errores reales** en producción: cuando un usuario corrige la confirmación del bot, ese par mensaje → corrección va al dataset de evals.
-5. **Destilar clasificador** cuando el dataset de pares correctos supere 500 ejemplos (ver roadmap v1).
+4. **Capturar errores reales**: cuando un usuario corrige la confirmación del bot, ese par va al dataset de evals (`eval_dataset`).
+5. **Destilar clasificador** cuando el dataset supere 500 ejemplos (roadmap v1).
 
 ---
 
@@ -110,7 +135,8 @@ field_level_accuracy = campos_correctos / total_campos_obligatorios
 
 | Fase | Acción | Output |
 |---|---|---|
-| **Semana 1** | Tomar 10–20 audios reales, testear 3 variantes de prompt (single-shot, ReAct 2-paso, Reflexion 3-paso), medir field-level accuracy a mano | Prompt PDR/SR inicial validado con datos reales |
-| **Semana 2** | Instalar LangFuse en GCP, construir dataset de 50–100 pares, conectar trazas al pipeline | Dashboard de observabilidad con costo real por tipo de evento |
-| **Mes 2** | Baseline formal de field-level accuracy, identificar campos con peor extracción, segunda iteración del prompt | Mejora documentada de accuracy vs baseline |
-| **Mes 3–6** | Acumular 500 pares corregidos, destilar clasificador de tipo de evento | Clasificador propio: costo −99% vs LLM completo |
+| **Semana 1** | 10–20 audios reales → testear 3 variantes de prompt, medir field-level accuracy a mano | Prompt PDR/SR inicial validado |
+| **Semana 2** | Instalar LangFuse en GCP (Cloud Run + tu Cloud SQL existente, ~$5–10/mes extra) | Dashboard de observabilidad activo |
+| **Semana 2** | Construir dataset de 50–100 pares, conectar trazas al pipeline | Costo real por tipo de evento visible |
+| **Mes 2** | Baseline formal de field-level accuracy, segunda iteración del prompt | Mejora documentada vs baseline |
+| **Mes 3–6** | 500 pares corregidos → destilar clasificador de tipo de evento | Clasificador propio: costo −99% vs LLM |

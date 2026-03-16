@@ -69,12 +69,15 @@ CREATE TABLE raw_messages (
 
 -- 7. Mensajes procesados (STT/OCR)
 CREATE TABLE message_processed (
-  id_raw           BIGINT PRIMARY KEY REFERENCES raw_messages(id_raw),
-  text_stt         TEXT,
-  text_ocr         TEXT,
-  language         VARCHAR(10),
-  processing_status VARCHAR(20) NOT NULL DEFAULT 'ok', -- 'ok','failed',...
-  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+  id_raw            BIGINT PRIMARY KEY REFERENCES raw_messages(id_raw),
+  text_stt          TEXT,
+  text_stt_corrected TEXT,  -- transcript post-correción LLM (jerga agro)
+  text_ocr          TEXT,
+  language          VARCHAR(10),
+  stt_model         VARCHAR(100),    -- 'whisper-self-hosted','voxtral',...
+  stt_confidence    NUMERIC,         -- confianza del modelo STT (0–1)
+  processing_status VARCHAR(20) NOT NULL DEFAULT 'ok', -- 'ok','failed','low_confidence'
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- 8. Eventos operativos normalizados
@@ -82,18 +85,24 @@ CREATE TABLE events (
   id_event              BIGSERIAL PRIMARY KEY,
   id_user               INT NOT NULL REFERENCES users(id_user),
   id_farm               INT NOT NULL REFERENCES farms(id_farm),
-  id_field              INT     REFERENCES fields(id_field), -- puede ser NULL si scope='farm'
+  id_field              INT     REFERENCES fields(id_field),
   scope                 VARCHAR(20) NOT NULL DEFAULT 'field', -- 'farm' o 'field'
-  event_type            VARCHAR(50) NOT NULL,                -- 'pest','input_application',...
-  risk_level            VARCHAR(20),                         -- 'low','medium','high'
+  event_type            VARCHAR(50) NOT NULL,
+  risk_level            VARCHAR(20),
   status                VARCHAR(30) NOT NULL DEFAULT 'pending_review',
-  event_time            TIMESTAMPTZ,                         -- hora del evento en campo
-  source_time_confidence NUMERIC,                            -- 0–1
+  event_time            TIMESTAMPTZ,
+  source_time_confidence NUMERIC,
   raw_message_id        BIGINT REFERENCES raw_messages(id_raw),
-  completeness_status   VARCHAR(30) NOT NULL DEFAULT 'pending', -- 'complete','needs_clarification'
-  mandatory_missing     JSONB,                               -- lista de campos obligatorios faltantes
+  completeness_status   VARCHAR(30) NOT NULL DEFAULT 'pending',
+  mandatory_missing     JSONB,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-  confirmed_at          TIMESTAMPTZ
+  ingested_at           TIMESTAMPTZ NOT NULL DEFAULT now(), -- tiempo de llegada al sistema
+  confirmed_at          TIMESTAMPTZ,
+  confirmed_by          INT REFERENCES users(id_user),
+  -- Campos de escalamiento (loop humano activo)
+  escalated_at          TIMESTAMPTZ,
+  escalated_to          INT REFERENCES users(id_user),
+  escalation_note       TEXT
 );
 
 -- 9. Payload flexible por evento (JSONB)
@@ -116,27 +125,29 @@ CREATE TABLE router_decisions (
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 11. Workspaces de razonamiento (PDR/SR)
+-- 11. Workspaces de razonamiento (PDR/SR — Reflexion Agent)
 CREATE TABLE workspaces (
-  id_workspace BIGSERIAL PRIMARY KEY,
-  id_event     BIGINT NOT NULL REFERENCES events(id_event) ON DELETE CASCADE,
-  workspace_text TEXT NOT NULL,      -- resumen corto de razonamiento
-  strategy       VARCHAR(20),        -- 'SR','PDR','single_pass'
+  id_workspace   BIGSERIAL PRIMARY KEY,
+  id_event       BIGINT NOT NULL REFERENCES events(id_event) ON DELETE CASCADE,
+  workspace_json JSONB NOT NULL,   -- JSON parcial acumulado (workspace-as-memory)
+  reflexion_note TEXT,             -- auto-crítica del agente
+  strategy       VARCHAR(20),      -- 'single_shot','react_2step','reflexion_3step'
   model_used     VARCHAR(100),
+  turn_number    INT DEFAULT 1,    -- turno de conversación multi-turn
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 12. Preferencias de usuario por finca (configuración de informes/panel)
+-- 12. Preferencias de usuario por finca
 CREATE TABLE user_preferences (
   id_preference     BIGSERIAL PRIMARY KEY,
   id_user           INT NOT NULL REFERENCES users(id_user),
   id_farm           INT NOT NULL REFERENCES farms(id_farm),
-  focus             VARCHAR(20),   -- 'yield','quality','costs','health','mixed'
-  time_horizon      VARCHAR(20),   -- 'day','week','month','all'
-  detail_level      VARCHAR(20),   -- 'farm','field','both'
-  report_frequency  VARCHAR(20),   -- 'daily','weekly','biweekly','alerts_only'
-  delivery_channels VARCHAR(50),   -- 'whatsapp','web+whatsapp','pdf+whatsapp'
-  status            VARCHAR(20) DEFAULT 'pending_review', -- 'pending_review','approved'
+  focus             VARCHAR(20),
+  time_horizon      VARCHAR(20),
+  detail_level      VARCHAR(20),
+  report_frequency  VARCHAR(20),
+  delivery_channels VARCHAR(50),
+  status            VARCHAR(20) DEFAULT 'pending_review',
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -147,24 +158,60 @@ CREATE TABLE reports (
   id_farm     INT NOT NULL REFERENCES farms(id_farm),
   from_date   DATE,
   to_date     DATE,
-  type        VARCHAR(20),  -- 'weekly','monthly',...
+  type        VARCHAR(20),
   file_uri    VARCHAR(500),
-  status      VARCHAR(20) DEFAULT 'draft', -- 'draft','approved','sent'
+  status      VARCHAR(20) DEFAULT 'draft',
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   approved_at TIMESTAMPTZ,
+  approved_by INT REFERENCES users(id_user),
   sent_at     TIMESTAMPTZ
 );
 
--- 14. Conversaciones de WhatsApp (estado de máquina de estados)
+-- 14. Conversaciones de WhatsApp
 CREATE TABLE wa_conversations (
   phone_msisdn   VARCHAR(30) PRIMARY KEY,
   id_user        INT REFERENCES users(id_user),
-  current_state  VARCHAR(100) NOT NULL, -- 'IDLE','ONBOARDING_Q1_FOCUS',...
+  current_state  VARCHAR(100) NOT NULL,
   context        JSONB,
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Índices útiles
+-- 15. Reglas de escalamiento por tipo de evento (loop humano activo)
+CREATE TABLE escalation_rules (
+  id_rule          SERIAL PRIMARY KEY,
+  event_type       VARCHAR(50) NOT NULL,
+  risk_level       VARCHAR(20),           -- 'low','medium','high','critical'
+  max_hours        NUMERIC NOT NULL,       -- SLA máximo en horas
+  escalate_to_role INT REFERENCES roles(id_role),
+  action_on_breach VARCHAR(100),          -- 'auto_approve','alert_manager','block_recommendation'
+  active           BOOLEAN DEFAULT TRUE
+);
+
+-- 16. Datos de evaluación de calidad IA (evals)
+CREATE TABLE eval_dataset (
+  id_eval          BIGSERIAL PRIMARY KEY,
+  source_message   TEXT NOT NULL,         -- mensaje crudo original
+  source_type      VARCHAR(20),           -- 'audio','text','image'
+  expected_json    JSONB NOT NULL,        -- JSON esperado (anotado a mano)
+  event_type       VARCHAR(50),
+  annotated_by     INT REFERENCES users(id_user),
+  annotated_at     TIMESTAMPTZ,
+  notes            TEXT
+);
+
+-- 17. Resultados de evals por modelo/prompt
+CREATE TABLE eval_results (
+  id_result         BIGSERIAL PRIMARY KEY,
+  id_eval           BIGINT NOT NULL REFERENCES eval_dataset(id_eval),
+  model_version     VARCHAR(100),
+  prompt_version    VARCHAR(50),
+  produced_json     JSONB,
+  field_accuracy    NUMERIC,              -- field-level accuracy 0–1
+  fields_detail     JSONB,               -- detalle por campo: {"id_field": true, "dose": false, ...}
+  evaluated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Índices principales
 
 CREATE INDEX idx_events_farm_time
   ON events (id_farm, event_time);
@@ -172,12 +219,12 @@ CREATE INDEX idx_events_farm_time
 CREATE INDEX idx_events_field_time
   ON events (id_field, event_time);
 
+CREATE INDEX idx_events_escalation
+  ON events (status, risk_level, created_at)
+  WHERE escalated_at IS NULL;
+
 CREATE INDEX idx_raw_messages_user_time
   ON raw_messages (id_user, ingested_at);
 
 CREATE INDEX idx_fields_farm
   ON fields (id_farm);
-
-CREATE INDEX idx_weather_location_gist
-  ON weather_hourly
-  USING GIST (location);
